@@ -1,0 +1,3 @@
+pydicom>=2.4
+numpy
+PySide6
