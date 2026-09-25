@@ -157,6 +157,7 @@ class State(QtCore.QObject):
     cross_changed = Signal()
     window_changed = Signal()
     style_changed = Signal()
+    proj_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -167,6 +168,13 @@ class State(QtCore.QObject):
         self.invert = False
         self.show_cross = True
         self.show_patient = False       # 患者名・ID・生年月日は既定で非表示
+        self.proj_mode = "none"         # none / mip / minip / mean (スラブ投影)
+        self.slab_mm = 10.0
+
+    def set_projection(self, mode=None, slab_mm=None):
+        self.proj_mode = mode or self.proj_mode
+        self.slab_mm = float(slab_mm) if slab_mm else self.slab_mm
+        self.proj_changed.emit()
 
     def set_series(self, s: Series):
         self.series = s
@@ -222,6 +230,64 @@ def _private(ds, group, elem, default=""):
     return str(v)
 
 
+PROJ_MODES = [("通常", "none"), ("MIP (最大値)", "mip"), ("MinIP (最小値)", "minip"), ("平均", "mean")]
+
+
+def measure_angle(p1, p2, p3, sx, sy):
+    """画像座標(px)の3点から、p2 を頂点とする角度[度]。画素間隔で mm に直して計算する。"""
+    v1 = np.array([(p1[0] - p2[0]) * sx, (p1[1] - p2[1]) * sy])
+    v2 = np.array([(p3[0] - p2[0]) * sx, (p3[1] - p2[1]) * sy])
+    n = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if n == 0:
+        return None
+    return math.degrees(math.acos(float(np.clip(np.dot(v1, v2) / n, -1.0, 1.0))))
+
+
+def roi_stats(a, p1, p2, sx, sy):
+    """画像座標の外接矩形 p1-p2 を持つ楕円 ROI の CT値統計"""
+    H, W = a.shape
+    cx, cy = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+    ax, ay = abs(p2[0] - p1[0]) / 2, abs(p2[1] - p1[1]) / 2
+    if ax < 0.5 or ay < 0.5:
+        return None
+    x0, x1 = max(0, int(cx - ax)), min(W, int(cx + ax) + 2)
+    y0, y1 = max(0, int(cy - ay)), min(H, int(cy + ay) + 2)
+    if x0 >= x1 or y0 >= y1:
+        return None
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    mask = ((xx + .5 - cx) / ax) ** 2 + ((yy + .5 - cy) / ay) ** 2 <= 1
+    vals = a[y0:y1, x0:x1][mask].astype(np.float64)
+    if vals.size == 0:
+        return None
+    return {"mean": vals.mean(), "std": vals.std(), "min": vals.min(), "max": vals.max(),
+            "area": vals.size * sx * sy, "n": int(vals.size)}
+
+
+def slab_project(vol, axis, idx, n, mode):
+    """axis 方向に idx を中心とした n 枚のスラブを投影 (mode: none/mip/minip/mean)"""
+    if mode == "none" or n <= 1:
+        return vol.take(idx, axis=axis)
+    lo = max(0, idx - n // 2)
+    hi = min(vol.shape[axis], idx - n // 2 + n)
+    sl = [slice(None)] * 3
+    sl[axis] = slice(lo, hi)
+    sub = vol[tuple(sl)]
+    if mode == "mip":
+        return sub.max(axis=axis)
+    if mode == "minip":
+        return sub.min(axis=axis)
+    return sub.mean(axis=axis, dtype=np.float32)
+
+
+def tissue_label(hu) -> str:
+    """CT値から組織の目安 (あくまで概算)"""
+    for limit, name in ((-900, "空気"), (-200, "肺野・空気混在"), (-20, "脂肪"), (15, "水・髄液"),
+                        (70, "軟部組織(脳・筋)"), (300, "高吸収(出血・造影・石灰化)")):
+        if hu < limit:
+            return name
+    return "骨"
+
+
 def _text(p: QtGui.QPainter, x, y, s, color=QtGui.QColor(255, 235, 120)):
     p.setPen(QtGui.QColor(0, 0, 0, 220))
     p.drawText(int(x) + 1, int(y) + 1, s)
@@ -246,6 +312,11 @@ class ImageView(QtWidgets.QWidget):
         self._drag = None
         self._last = QPointF()
         self._temp = None
+        self._hu = None
+        self._hu_key = None
+        self._angle_pts: list = []
+        self._angle_slice = None
+        self._cursor = (0.0, 0.0)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(200, 200)
@@ -253,6 +324,7 @@ class ImageView(QtWidgets.QWidget):
         state.series_changed.connect(self._on_series)
         state.cross_changed.connect(self.update)
         state.window_changed.connect(self.update)
+        state.proj_changed.connect(self.update)
         state.style_changed.connect(self._on_style)
         self._on_style()
 
@@ -281,12 +353,16 @@ class ImageView(QtWidgets.QWidget):
         return {"axial": nz, "coronal": ny, "sagittal": nx}[self.plane]
 
     def slice_hu(self) -> np.ndarray:
-        v, i = self.ser.volume, self.slice_index()
-        if self.plane == "axial":
-            return v[i]
-        if self.plane == "coronal":
-            return v[::-1, i, :]            # 頭側が上
-        return v[::-1, :, i]
+        """表示中の断面のCT値 (スラブ投影が有効なら投影後)。同条件ならキャッシュを返す"""
+        st, s, i = self.state, self.ser, self.slice_index()
+        key = (id(s), self.plane, i, st.proj_mode, st.slab_mm)
+        if key != self._hu_key:
+            axis = {"axial": 0, "coronal": 1, "sagittal": 2}[self.plane]
+            step = {"axial": s.dz, "coronal": s.sy, "sagittal": s.sx}[self.plane]
+            a = slab_project(s.volume, axis, i, max(1, round(st.slab_mm / step)), st.proj_mode)
+            self._hu = a if self.plane == "axial" else a[::-1]      # Coronal/Sagittal は頭側が上
+            self._hu_key = key
+        return self._hu
 
     def cross_pos(self):
         z, y, x = self.state.cross
@@ -341,12 +417,16 @@ class ImageView(QtWidgets.QWidget):
 
     def _on_series(self):
         self.meas.clear()
+        self._angle_pts = []
+        self._hu_key = None
         self._key = None
         self.reset_view()
 
     def _on_style(self):
         cur = {"pan": Qt.OpenHandCursor, "window": Qt.SizeAllCursor}.get(self.state.tool, Qt.CrossCursor)
         self.setCursor(cur)
+        if self.state.tool != "angle":
+            self._angle_pts = []
         self.update()
 
     def clear_current(self):
@@ -375,24 +455,31 @@ class ImageView(QtWidgets.QWidget):
         return item
 
     def _roi_stats(self, p1, p2):
-        a = self.slice_hu()
-        H, W = a.shape
-        cx, cy = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-        ax, ay = abs(p2[0] - p1[0]) / 2, abs(p2[1] - p1[1]) / 2
-        if ax < 0.5 or ay < 0.5:
-            return None
-        x0, x1 = max(0, int(cx - ax)), min(W, int(cx + ax) + 2)
-        y0, y1 = max(0, int(cy - ay)), min(H, int(cy + ay) + 2)
-        if x0 >= x1 or y0 >= y1:
-            return None
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        mask = ((xx + .5 - cx) / ax) ** 2 + ((yy + .5 - cy) / ay) ** 2 <= 1
-        vals = a[y0:y1, x0:x1][mask].astype(np.float64)
-        if vals.size == 0:
-            return None
-        sx, sy = self.spacing()
-        return {"mean": vals.mean(), "std": vals.std(), "min": vals.min(), "max": vals.max(),
-                "area": vals.size * sx * sy, "n": int(vals.size)}
+        return roi_stats(self.slice_hu(), p1, p2, *self.spacing())
+
+    def _make_angle(self, pts):
+        item = {"kind": "angle", "pts": list(pts), "lines": []}
+        if len(pts) == 3:
+            a = measure_angle(*pts, *self.spacing())
+            if a is not None:
+                item["value"] = a
+                item["lines"] = [f"{a:.1f} deg"]
+        return item
+
+    def _finish_angle(self):
+        item = self._make_angle(self._angle_pts)
+        self._angle_pts = []
+        if "value" in item:
+            idx = self.slice_index()
+            self.meas.setdefault(idx, []).append(item)
+            self.measured.emit(f"[{self.TITLES[self.plane]} {idx + 1}/{self.slice_count()}] 角度: {item['value']:.1f} deg")
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self._angle_pts:
+            self._angle_pts = []                     # 作図中の角度を取り消す
+            self.update()
+        else:
+            super().keyPressEvent(e)
 
     def _finish_item(self):
         item, self._temp = self._temp, None
@@ -414,7 +501,8 @@ class ImageView(QtWidgets.QWidget):
 
     # ---- 描画 ----------------------------------------------------------
     def _image(self):
-        key = (id(self.ser), self.plane, self.slice_index(), self.state.wc, self.state.ww, self.state.invert)
+        key = (id(self.ser), self.plane, self.slice_index(), self.state.wc, self.state.ww, self.state.invert,
+               self.state.proj_mode, self.state.slab_mm)
         if key != self._key:
             img = np.ascontiguousarray(self.state.to_display(self.slice_hu()))
             H, W = img.shape
@@ -450,30 +538,44 @@ class ImageView(QtWidgets.QWidget):
         p.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
     def _paint_measurements(self, p):
-        items = list(self.meas.get(self.slice_index(), []))
+        idx = self.slice_index()
+        items = list(self.meas.get(idx, []))
         if self._temp:
             items.append(self._temp)
+        if self._angle_pts and self._angle_slice != idx:
+            self._angle_pts = []                     # スライスが変わったら作図中の角度は破棄
+        if self._angle_pts:
+            items.append(self._make_angle(self._angle_pts + ([self._cursor] if len(self._angle_pts) < 3 else [])))
         f = p.font()
         f.setPointSize(9)
         p.setFont(f)
         cy = QtGui.QColor(0, 220, 255)
+        fm = p.fontMetrics()
         for it in items:
-            a, b = self.to_screen(*it["p1"]), self.to_screen(*it["p2"])
             p.setPen(QtGui.QPen(cy, 1.6))
-            if it["kind"] == "dist":
+            if it["kind"] == "angle":
+                pts = [self.to_screen(*q) for q in it["pts"]]
+                p.drawPolyline(pts)
+                for q in pts:
+                    p.drawEllipse(q, 3, 3)
+                if len(pts) < 3:
+                    continue
+                tx, ty = pts[1].x() + 8, pts[1].y() - 8
+            elif it["kind"] == "dist":
+                a, b = self.to_screen(*it["p1"]), self.to_screen(*it["p2"])
                 p.drawLine(a, b)
                 for q in (a, b):
                     p.drawEllipse(q, 3, 3)
                 tx, ty = (a.x() + b.x()) / 2 + 6, (a.y() + b.y()) / 2 - 6
             else:
+                a, b = self.to_screen(*it["p1"]), self.to_screen(*it["p2"])
                 r = QRectF(a, b).normalized()
                 p.setBrush(QtGui.QColor(0, 220, 255, 30))
                 p.drawEllipse(r)
                 p.setBrush(Qt.NoBrush)
                 tx, ty = r.right() + 6, r.top() + 12
-            fm = p.fontMetrics()
-            for i, s in enumerate(it["lines"]):
-                _text(p, tx, ty + i * fm.height(), s, cy)
+            for i, line in enumerate(it["lines"]):
+                _text(p, tx, ty + i * fm.height(), line, cy)
 
     def _paint_overlay(self, p):
         s, ds = self.ser, self.ser.datasets[0]
@@ -513,6 +615,9 @@ class ImageView(QtWidgets.QWidget):
             bl = [f"{'Cor' if self.plane == 'coronal' else 'Sag'} {idx + 1}/{self.slice_count()}",
                   f"Loc {axis} = {val:.2f} mm"]
         br = [f"W: {self.state.ww:.0f}  L: {self.state.wc:.0f}", f"Zoom {self.zoom * 100:.0f}%"]
+        if self.state.proj_mode != "none":
+            name = {v: k for k, v in PROJ_MODES}[self.state.proj_mode].split(" ")[0]
+            br.insert(0, f"{name} {self.state.slab_mm:.0f} mm")
 
         for i, t in enumerate(tl):
             _text(p, 8, 8 + fm.ascent() + i * lh, t)
@@ -567,6 +672,12 @@ class ImageView(QtWidgets.QWidget):
                 self.set_cross_from_image(col, row)
             elif tool in ("dist", "roi"):
                 self._temp = self._make_item(tool, (col, row), (col, row))
+            elif tool == "angle":
+                self._angle_slice = self.slice_index()
+                self._angle_pts.append((col, row))
+                if len(self._angle_pts) == 3:
+                    self._finish_angle()
+                self.update()
         if self._drag == "pan":
             self.setCursor(Qt.ClosedHandCursor)
 
@@ -574,7 +685,10 @@ class ImageView(QtWidgets.QWidget):
         if self.ser is None:
             return
         col, row = self.to_image(e.position())
+        self._cursor = (col, row)
         self.hovered.emit(self, col, row)
+        if self._angle_pts:
+            self.update()
         d = e.position() - self._last
         self._last = e.position()
         if self._drag == "cross":
@@ -614,14 +728,19 @@ class ImageView(QtWidgets.QWidget):
             self.pan += e.position() - self.to_screen(*before)      # カーソル位置を固定してズーム
             self.update()
         else:
-            step = (5 if e.modifiers() & Qt.ShiftModifier else 1) * (-1 if dy > 0 else 1)
-            z, y, x = self.state.cross
-            if self.plane == "axial":
-                self.state.set_cross(z + step, y, x)
-            elif self.plane == "coronal":
-                self.state.set_cross(z, y + step, x)
-            else:
-                self.state.set_cross(z, y, x + step)
+            self.step((5 if e.modifiers() & Qt.ShiftModifier else 1) * (-1 if dy > 0 else 1))
+
+    def step(self, delta: int):
+        """この断面のスライス位置を delta 枚動かす"""
+        if self.ser is None:
+            return
+        z, y, x = self.state.cross
+        if self.plane == "axial":
+            self.state.set_cross(z + delta, y, x)
+        elif self.plane == "coronal":
+            self.state.set_cross(z, y + delta, x)
+        else:
+            self.state.set_cross(z, y, x + delta)
 
 
 # ======================================================================
@@ -700,6 +819,83 @@ class TagDialog(QtWidgets.QDialog):
 # ======================================================================
 # メインウィンドウ
 # ======================================================================
+class HistogramWidget(QtWidgets.QWidget):
+    """現在の Axial スライスの CT値ヒストグラム (対数)。窓範囲を重ね、ドラッグで窓を指定できる"""
+    LO, HI, BIN = -1100, 2000, 20
+
+    def __init__(self, state: State):
+        super().__init__()
+        self.state = state
+        self.setFixedHeight(150)
+        self._key = None
+        self._counts = None
+        self._x0 = None
+        state.cross_changed.connect(self.update)
+        state.window_changed.connect(self.update)
+        state.series_changed.connect(self.update)
+
+    def _hist(self):
+        s, z = self.state.series, self.state.cross[0]
+        if (id(s), z) != self._key:
+            self._counts, _ = np.histogram(s.volume[z], bins=np.arange(self.LO, self.HI + self.BIN, self.BIN))
+            self._key = (id(s), z)
+        return self._counts
+
+    def _plot_rect(self):
+        return QRectF(10, 18, self.width() - 20, self.height() - 18 - 18)
+
+    def _x_of(self, hu):
+        r = self._plot_rect()
+        return r.left() + (hu - self.LO) / (self.HI - self.LO) * r.width()
+
+    def _hu_of(self, x):
+        r = self._plot_rect()
+        return self.LO + (x - r.left()) / r.width() * (self.HI - self.LO)
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor(30, 30, 32))
+        p.setFont(QtGui.QFont("Consolas", 8))
+        if self.state.series is None:
+            return
+        r = self._plot_rect()
+        c = self._hist()
+        h = np.log10(1 + c.astype(np.float64))
+        h = h / max(h.max(), 1e-9)
+        bw = r.width() / len(c)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor(120, 160, 220))
+        for i, v in enumerate(h):
+            if v > 0:
+                p.drawRect(QRectF(r.left() + i * bw, r.bottom() - v * r.height(), max(bw - 0.5, 0.5), v * r.height()))
+        lo, hi = self.state.wc - self.state.ww / 2, self.state.wc + self.state.ww / 2
+        xl, xh = self._x_of(max(lo, self.LO)), self._x_of(min(hi, self.HI))
+        p.setBrush(QtGui.QColor(255, 220, 60, 55))
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 220, 60), 1))
+        p.drawRect(QRectF(xl, r.top(), max(xh - xl, 1), r.height()))
+        p.setPen(QtGui.QColor(160, 160, 160))
+        for t in range(-1000, 2001, 500):
+            x = self._x_of(t)
+            p.drawLine(QPointF(x, r.bottom()), QPointF(x, r.bottom() + 3))
+            p.drawText(QRectF(x - 25, r.bottom() + 3, 50, 12), Qt.AlignCenter, str(t))
+        p.setPen(QtGui.QColor(255, 235, 120))
+        p.drawText(QRectF(10, 2, self.width() - 20, 14), Qt.AlignLeft,
+                   f"CT値ヒストグラム (Axial {self.state.cross[0] + 1}, 対数)   窓: {lo:.0f} ~ {hi:.0f} HU   [ドラッグで窓指定]")
+
+    def mousePressEvent(self, e):
+        if self.state.series is not None and e.button() == Qt.LeftButton:
+            self._x0 = self._hu_of(e.position().x())
+
+    def mouseMoveEvent(self, e):
+        if self._x0 is not None:
+            x1 = self._hu_of(e.position().x())
+            if abs(x1 - self._x0) >= 1:
+                self.state.set_window((self._x0 + x1) / 2, abs(x1 - self._x0))
+
+    def mouseReleaseEvent(self, e):
+        self._x0 = None
+
+
 HELP_TEXT = """\
 【操作】
  ホイール       : スライス送り (Shiftで5枚ずつ)
@@ -709,7 +905,11 @@ HELP_TEXT = """\
  左クリック/ドラッグ: ツールに従う
    C 位置(十字線)  W ウィンドウ  H パン
    D 距離計測      E 楕円ROI (Mean/SD/Min/Max/面積)
+   A 角度計測 (3点クリック、頂点は2点目 / Escで取消)
  1-6 プリセット  I 白黒反転  X 十字線  R ズーム解除
+ M 投影切替 (通常/MIP/MinIP/平均、厚みはツールバー)
+ Space シネ再生  矢印/PageUp/PageDown/Home/End スライス送り
+ ヒストグラム上をドラッグ: 窓範囲を指定
  P 患者情報表示  T タグ一覧  L Axialのみ/MPR切替
  Del 現スライスの計測消去 / Ctrl+Del 全消去
  Ctrl+O フォルダを開く / Ctrl+S 画面を保存
@@ -729,6 +929,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.setFont(QtGui.QFont("Consolas", 9))
         self.tag_dialog: TagDialog | None = None
         self._tag_z = None
+        self.active_view = self.views["axial"]      # 矢印キーの操作対象 (最後に触れたビュー)
+        self.hist = HistogramWidget(self.state)
+        self.side = QtWidgets.QWidget()
+        side_lay = QtWidgets.QVBoxLayout(self.side)
+        side_lay.setContentsMargins(0, 0, 0, 0)
+        side_lay.setSpacing(2)
+        side_lay.addWidget(self.hist)
+        side_lay.addWidget(self.log)
+        self.cine_timer = QtCore.QTimer(self)
+        self.cine_timer.timeout.connect(self._cine_tick)
 
         self.grid = grid = QtWidgets.QGridLayout()
         grid.setContentsMargins(2, 2, 2, 2)
@@ -736,7 +946,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.views["axial"], 0, 0)
         grid.addWidget(self.views["coronal"], 0, 1)
         grid.addWidget(self.views["sagittal"], 1, 0)
-        grid.addWidget(self.log, 1, 1)
+        grid.addWidget(self.side, 1, 1)
         for c in (0, 1):
             grid.setColumnStretch(c, 1)
             grid.setRowStretch(c, 1)
@@ -751,6 +961,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_actions()
         for v in self.views.values():
             v.hovered.connect(self._on_hover)
+            v.hovered.connect(lambda view, *_: setattr(self, "active_view", view))
             v.measured.connect(self.log.appendPlainText)
         self.state.window_changed.connect(self._sync_window_widgets)
         self.state.cross_changed.connect(self._refresh_tags)
@@ -788,7 +999,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         group = QtGui.QActionGroup(self)
         for name, key, tool in (("位置(C)", "C", "cross"), ("窓(W)", "W", "window"), ("パン(H)", "H", "pan"),
-                                ("距離(D)", "D", "dist"), ("ROI(E)", "E", "roi")):
+                                ("距離(D)", "D", "dist"), ("ROI(E)", "E", "roi"), ("角度(A)", "A", "angle")):
             a = self._act(name, key, lambda on, t=tool: on and self._set_tool(t), True, tool == "cross")
             group.addAction(a)
             tb.addAction(a)
@@ -815,7 +1026,41 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.wc_spin)
         tb.addWidget(QtWidgets.QLabel(" W:"))
         tb.addWidget(self.ww_spin)
-        tb.addSeparator()
+
+        self.addToolBarBreak()
+        tb2 = self.addToolBar("view")
+        tb2.setMovable(False)
+        tb2.addWidget(QtWidgets.QLabel(" 投影: "))
+        self.proj_combo = QtWidgets.QComboBox()
+        for name, _ in PROJ_MODES:
+            self.proj_combo.addItem(name)
+        self.proj_combo.currentIndexChanged.connect(self._on_proj)
+        tb2.addWidget(self.proj_combo)
+        self.slab_spin = QtWidgets.QDoubleSpinBox()
+        self.slab_spin.setRange(1, 200)
+        self.slab_spin.setDecimals(0)
+        self.slab_spin.setValue(self.state.slab_mm)
+        self.slab_spin.setSuffix(" mm")
+        self.slab_spin.valueChanged.connect(self._on_proj)
+        tb2.addWidget(QtWidgets.QLabel(" 厚み:"))
+        tb2.addWidget(self.slab_spin)
+        self.addAction(self._act("投影切替", "M", lambda: self.proj_combo.setCurrentIndex(
+            (self.proj_combo.currentIndex() + 1) % len(PROJ_MODES))))
+        tb2.addSeparator()
+
+        self.cine_act = self._act("再生(Space)", "Space", self._toggle_cine, True)
+        tb2.addAction(self.cine_act)
+        self.fps_spin = QtWidgets.QSpinBox()
+        self.fps_spin.setRange(1, 60)
+        self.fps_spin.setValue(10)
+        self.fps_spin.setSuffix(" fps")
+        self.fps_spin.valueChanged.connect(lambda v: self.cine_timer.setInterval(int(1000 / v)))
+        tb2.addWidget(self.fps_spin)
+        for key, d in (("Up", -1), ("Left", -1), ("Down", 1), ("Right", 1), ("PgUp", -10), ("PgDown", 10)):
+            self.addAction(self._act(f"スライス{d:+d}", key, lambda _=False, d=d: self.active_view.step(d)))
+        self.addAction(self._act("先頭", "Home", lambda: self.active_view.step(-10 ** 6)))
+        self.addAction(self._act("末尾", "End", lambda: self.active_view.step(10 ** 6)))
+        tb2.addSeparator()
 
         inv = self._act("反転(I)", "I", self._set_invert, True)
         crs = self._act("十字線(X)", "X", self._set_show_cross, True, True)
@@ -828,7 +1073,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for a in (inv, crs, pat, lay, rst, tags, clr, clr_all):
             m_view.addAction(a)
         for a in (inv, crs, pat, lay, tags, clr):
-            tb.addAction(a)
+            tb2.addAction(a)
 
     # ---- 読み込み ------------------------------------------------------
     def load_folder(self, folder: str):
@@ -902,7 +1147,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state.style_changed.emit()
 
     def _set_axial_only(self, on):
-        for w in (self.views["coronal"], self.views["sagittal"], self.log):
+        for w in (self.views["coronal"], self.views["sagittal"], self.side):
             w.setVisible(not on)
         self.grid.setColumnStretch(1, 0 if on else 1)      # 非表示の列・行にスペースを残さない
         self.grid.setRowStretch(1, 0 if on else 1)
@@ -915,6 +1160,21 @@ class MainWindow(QtWidgets.QMainWindow):
             wc, ww = self.state.series.default_window
         self.preset_combo.setCurrentIndex(i)
         self.state.set_window(wc, ww)
+
+    def _on_proj(self, *_):
+        self.state.set_projection(PROJ_MODES[self.proj_combo.currentIndex()][1], self.slab_spin.value())
+
+    def _toggle_cine(self, on):
+        if on and self.state.series is not None:
+            self.cine_timer.start(int(1000 / self.fps_spin.value()))
+        else:
+            self.cine_timer.stop()
+            self.cine_act.setChecked(False)
+
+    def _cine_tick(self):
+        z, y, x = self.state.cross
+        nz = self.state.series.shape[0]
+        self.state.set_cross((z + 1) % nz, y, x)        # Axial を先頭スライスからループ再生
 
     def _on_spin(self):
         if self.state.series is not None:
@@ -937,8 +1197,9 @@ class MainWindow(QtWidgets.QMainWindow):
         z, y, x = view.voxel_at(col, row)
         s = self.state.series
         pt = s.patient_point(z, y, x)
+        hu = float(view.slice_hu()[int(row), int(col)])        # 投影表示中はその値
         self.hover_label.setText(
-            f"{view.TITLES[view.plane]}  voxel(x,y,z)=({x},{y},{z})  HU={s.volume[z, y, x]:.0f}  "
+            f"{view.TITLES[view.plane]}  voxel(x,y,z)=({x},{y},{z})  HU={hu:.0f} ({tissue_label(hu)})  "
             f"患者座標(mm) X={pt[0]:.1f} Y={pt[1]:.1f} Z={pt[2]:.1f}")
 
     # ---- タグ一覧・保存 ------------------------------------------------
